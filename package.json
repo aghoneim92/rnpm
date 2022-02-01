@@ -1,0 +1,8 @@
+{
+  "name": "alotta-modules",
+  "version": "0.0.1",
+  "dependencies": {
+    "animate.less": "^2.2.0",
+    "autoprefixer": "^6.0.3"
+  }
+}
