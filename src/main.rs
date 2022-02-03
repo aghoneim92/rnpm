@@ -1,12 +1,15 @@
+use anyhow::{Context, Error, Result};
 use async_recursion::async_recursion;
 use hyper::body::to_bytes;
 use hyper::client::HttpConnector;
+use hyper::http::uri::{Authority, Parts, PathAndQuery, Scheme};
 use hyper::{Body, Client, Method, Request, Uri};
 use hyper_tls::HttpsConnector;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
+use std::str::FromStr;
 
 mod semver;
 
@@ -56,21 +59,6 @@ struct DependencyNode {
     dev_dependencies: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug)]
-struct RnpmError {
-    message: String,
-}
-
-impl std::fmt::Display for RnpmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for RnpmError {}
-unsafe impl Send for RnpmError {}
-unsafe impl Sync for RnpmError {}
-
 type HttpsClient = Client<HttpsConnector<HttpConnector>>;
 
 #[derive(Clone)]
@@ -78,11 +66,10 @@ struct Rnpm {
     client: HttpsClient,
     metadata_cache: Cache<String, PackageMetadata>,
     dependency_node_cache: Cache<String, DependencyNode>,
+    registry_uri_authority: Authority,
 }
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
-async fn fetch_metadata(rnpm: Rnpm, package_name: String) -> Result<PackageMetadata, Error> {
+async fn fetch_metadata(rnpm: Rnpm, package_name: String) -> Result<PackageMetadata> {
     println!("Fetching metadata for {}", package_name);
     let metadata = rnpm.metadata_cache.get(&package_name);
     if let Some(metadata) = metadata {
@@ -90,7 +77,13 @@ async fn fetch_metadata(rnpm: Rnpm, package_name: String) -> Result<PackageMetad
         return Ok(metadata);
     }
 
-    let uri: Uri = format!("https://registry.npmjs.org/{}", package_name).parse()?;
+    let mut parts = Parts::default();
+    parts.authority = Some(rnpm.registry_uri_authority);
+    let path_and_query = PathAndQuery::try_from(format!("/{}", package_name))?;
+    parts.path_and_query = Some(path_and_query);
+    parts.scheme = Some(Scheme::HTTPS);
+    let uri = Uri::from_parts(parts)?;
+
     let request = Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -115,7 +108,7 @@ async fn resolve_dependencies(
     rnpm: Rnpm,
     package_name: String,
     dependencies: HashMap<String, String>,
-) -> Result<(), Error> {
+) -> Result<()> {
     println!("Resolving dependencies for {}", package_name);
     let metadata_futs = dependencies
         .iter()
@@ -124,27 +117,19 @@ async fn resolve_dependencies(
     let mut recursion_futs = vec![];
     for result in results {
         let metadata = result??;
-        let semver = dependencies.get(&metadata.name).ok_or_else(|| -> Error {
-            Box::new(RnpmError {
-                message: format!(
-                    "Failed to find dependency with name {} in {}",
-                    metadata.name, package_name
-                ),
-            })
+        let semver = dependencies.get(&metadata.name).ok_or_else(|| {
+            Error::msg(format!(
+                "Failed to find dependency with name {} in {}",
+                metadata.name, package_name
+            ))
         })?;
         let resolved_version = resolve_version(metadata.clone(), semver.clone())?;
-        let version_metadata =
-            metadata
-                .versions
-                .get(&resolved_version)
-                .ok_or_else(|| -> Error {
-                    Box::new(RnpmError {
-                        message: format!(
-                            "Failed to find version for {}@{}",
-                            metadata.name, resolved_version
-                        ),
-                    })
-                })?;
+        let version_metadata = metadata.versions.get(&resolved_version).ok_or_else(|| {
+            Error::msg(format!(
+                "Failed to find version for {}@{}",
+                metadata.name, resolved_version
+            ))
+        })?;
         recursion_futs.push(tokio::spawn(recurse_node(
             rnpm.clone(),
             DependencyNode {
@@ -164,7 +149,7 @@ async fn resolve_dependencies(
 }
 
 #[async_recursion]
-async fn recurse_node(rnpm: Rnpm, dependency_node: DependencyNode) -> Result<(), Error> {
+async fn recurse_node(rnpm: Rnpm, dependency_node: DependencyNode) -> Result<()> {
     let version_string = format!("{}@{}", dependency_node.name, dependency_node.version);
     println!("Recursing package {}", version_string);
     let cached_dependency_node = rnpm.dependency_node_cache.get(&version_string);
@@ -181,7 +166,7 @@ async fn recurse_node(rnpm: Rnpm, dependency_node: DependencyNode) -> Result<(),
     Ok(())
 }
 
-fn resolve_version(metadata: PackageMetadata, semver: String) -> Result<String, Error> {
+fn resolve_version(metadata: PackageMetadata, semver: String) -> Result<String> {
     println!("Resolving version for {}@{}", metadata.name, semver);
     let dist_tags = metadata.dist_tags.clone();
     let found_version = dist_tags.get(&semver);
@@ -200,13 +185,11 @@ fn resolve_version(metadata: PackageMetadata, semver: String) -> Result<String, 
         .iter()
         .rfind(|val| Semver::satisfies_semver(semver.to_string(), val.to_string()))
         .map(|value| value.to_string())
-        .ok_or_else(|| -> Error {
-            Box::new(RnpmError {
-                message: format!(
-                    "Failed to find a matching version for {}@{}",
-                    metadata.name, semver
-                ),
-            })
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "Failed to find a matching version for {}@{}",
+                metadata.name, semver
+            ))
         })
 }
 
@@ -216,16 +199,18 @@ impl Rnpm {
         let client = Client::builder().build(connector);
         let metadata_cache = Cache::new(10_100);
         let dependency_node_cache = Cache::new(10_000);
+        let authority = Authority::from_str("registry.npmjs.org").unwrap();
         Self {
             client,
             metadata_cache,
             dependency_node_cache,
+            registry_uri_authority: authority,
         }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<()> {
     let file = File::open("package.json")?;
     let package_json: PackageJson = serde_json::from_reader(file)?;
     let rnpm: Rnpm = Rnpm::new();
