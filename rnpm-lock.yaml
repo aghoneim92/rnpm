@@ -178,7 +178,6 @@ dependencies:
   moment: 2.29.1
   moment-range: 2.2.0
   moment-timezone: 0.5.34
-  nan-as: 1.6.1
   password-policy: 0.0.2
   postcss-reporter: 1.4.1
   progress: 2.0.3
@@ -223,3 +222,6 @@ dependencies:
   webpack-notifier: 1.15.0
   webpack-split-by-path: 2.0.0
   whatwg-fetch: 2.0.4
+
+devDependencies:
+  nan-as: 1.6.1
